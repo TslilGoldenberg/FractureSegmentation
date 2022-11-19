@@ -1,22 +1,24 @@
 import numpy as np
 import skimage
 from skimage.measure import label
-from skimage.morphology import opening, closing
+from skimage.morphology import (erosion, dilation, closing, opening,
+                                area_closing, area_opening)
 import nibabel as nib
 import cv2 as cv2
+import dicom2nifti
+import os
+from matplotlib import pyplot as plt
 
 MAX_VOXEL_VALUE = 65535
 MIN_VOXEL_VALUE = 0
 FAILURE = -1
-MAX_VOXEL_VALUE = 65535
-MIN_VOXEL_VALUE = 0
 DERIVATIVE_KERNEL = [1, -1]
 
 
 class PreProcessor:
-    def __init__(self, nifty_file: str):
-        self.nifty_file = nifty_file
-        self.raw_img = nib.load(nifty_file)
+    def __init__(self, nifti_file: str):
+        self.nifty_file = nifti_file
+        self.raw_img = nib.load(nifti_file)
         self.img_data = self.raw_img.get_fdata().astype(dtype=np.uint16)
         _, _, z_slices = np.nonzero(self.img_data)
         self.bottom_bound_slice, self.top_bound_slice = np.min(z_slices), np.max(z_slices)
@@ -82,20 +84,9 @@ class PreProcessor:
         for slice in range(self.bottom_bound_slice, self.top_bound_slice):
             frame = self.img_data[:, :, slice]
             frame = cv2.equalizeHist(frame.astype(np.uint8))
-            # frame = cv2.GaussianBlur(frame, (5, 5), 1.5)
-            # frame = cv2.Canny(frame, 100, 190, 3)
-            # frame = cv2.dilate(frame, cv2.getStructuringElement(cv2.MORPH_CROSS, (2,2)), 2)
             out[:, :, slice] = frame
         return out
 
-    def _extractPelvic(self):
-        # Step 1: Apply Adaptive Histogram Equalizer
-        self.img_data = self._slice_process()
-
-        # Step 2: Apply Thresholding for Skeleton
-        self.bones = self.SkeletonTHFinder(self.nifty_file)
-        final_image = nib.Nifti1Image(self.bones, self.raw_img.affine)
-        nib.save(final_image, f"out_seg.nii.gz")
 
 
         # Step 3: Get a general ROI
@@ -105,9 +96,29 @@ class PreProcessor:
         largestCC_img = self.bones*largestCC
         largestCC_img = skimage.morphology.closing(largestCC_img)
         final_image = nib.Nifti1Image(largestCC_img, self.raw_img.affine)
-        nib.save(final_image, f"out_largestCC.nii.gz")
+        nib.save(final_image, "out_largestCC.nii.gz")
+
+    def get_pelvis_ROI(self):
+        bin_res = np.zeros(self.img_data.copy().shape)
+        bin_res[self.img_data > 0] = 1
+        slices = np.sum(bin_res, axis=(0,1))
+        plt.plot(np.arange(slices.shape[0]), slices)
+        plt.show()
+        res = bin_res[:,:,100:400]
+        final_image = nib.Nifti1Image(res, self.raw_img.affine)
+        nib.save(final_image, "ROI_test.nii.gz")
+
+    @staticmethod
+    def convert_files_from_dicom2nifti(num_files: int):
+        for i in range(1, num_files+1):
+            dicom_directory = f"dicom_directory/{i}"
+            output_directory = f"output_directory_{i}"
+            os.mkdir(output_directory)
+            dicom2nifti.convert_directory(dicom_directory, output_directory, compression=True, reorient=True)
+
 
 if __name__ == "__main__":
-    ob = PreProcessor(nifty_file='datasets/case1.nii.gz')
-    ob._extractPelvic()
-    ob.get_Nlargest_component()
+    ob = PreProcessor(nifti_file='out_largestCC.nii.gz')
+    # ob.get_pelvis_ROI()
+    # ob.get_Nlargest_component()
+
