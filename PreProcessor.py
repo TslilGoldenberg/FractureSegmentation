@@ -51,7 +51,7 @@ class PreProcessor:
         """
         if self.equalized_img is None:
             self.equalized_img = np.copy(self.img_data)
-            self.equalized_img = equalize_adapthist(self.equalized_img, nbins=MAX_VOXEL_VALUE) * (MAX_VOXEL_VALUE//4)
+            self.equalized_img = equalize_adapthist(self.equalized_img, nbins=MAX_VOXEL_VALUE) * (MAX_VOXEL_VALUE)
             self.equalized_img = self.equalized_img.astype(dtype=np.uint16)
 
 
