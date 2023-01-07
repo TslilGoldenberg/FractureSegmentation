@@ -26,7 +26,7 @@ DERIVATIVE_KERNEL = [1, -1]
 NIFTI = 'nii'
 
 class PreProcessor:
-    def __init__(self, file_path: str, output_directory: str, resolution=10):
+    def __init__(self, file_path: str, output_directory: str, resolution=10, Imax=1300):
         self.resolution = resolution
         self._dips = []
         self.isNIFTI = True if file_path.split('.').__contains__(NIFTI) else False
@@ -39,8 +39,10 @@ class PreProcessor:
         self.bottom_bound_slice, self.top_bound_slice = np.min(z_slices), np.max(z_slices)
         self.equalized_img = None
         self.bones = None
+        self.Imax = Imax
 
-
+        # self._num_cores = multiprocessing.cpu_count()
+        # self.chunks = [self.img_data[:,:,chunk * s:] for chunk in range(self._num_cores)]
 
 
     def _read_file(self, file_path:str):
@@ -82,7 +84,6 @@ class PreProcessor:
 
         return closed_img
 
-
     def SkeletonTHFinder(self):
         """
         This function iterates over 25 candidate Imin thresholds in the range of [150,500] (with intervals of 14).
@@ -97,19 +98,30 @@ class PreProcessor:
         :return:
         """
         Imin_range = np.arange(150, 514, self.resolution)
-        img_res = []
-        ccmps = []
+        num_cores = multiprocessing.cpu_count()
+        img_res = [[] for _ in range(num_cores)]
+        ccmps = [[] for _ in range(num_cores)]
+        d = ((514 - 150)//self.resolution)//num_cores
+        ranges = [np.arange(start=150+r*d*self.resolution, stop=150+r*d*self.resolution+d*self.resolution,
+                            step=self.resolution) for r in range(num_cores)]
+        processes = [multiprocessing.Process(target=self.do_segmentation, args=(ranges[p],ccmps,img_res)) for p in range(num_cores)]
+        for p in processes:
+            p.start()
+        # self.do_segmentation(Imin_range, ccmps, img_res)
+        for p in processes:
+            p.join()
+        self.find_all_minima(ccmps)
+        self._get_intensities_hist()
+        self.bones = img_res[self._dips[1]]
+        return self.bones
 
+    def do_segmentation(self, Imin_range, ccmps, img_res):
         for i_min in Imin_range:
-            img = self.SegmentationByTH(i_min, 1500)
+            img = self.SegmentationByTH(i_min, self.Imax)
             _, cmp = label(img, return_num=True)
             print(f"cmp:{cmp} and imin: {i_min}")
             ccmps.append(cmp)
             img_res.append(img)
-        self.find_first_minima(ccmps)
-        self._get_intensities_hist()
-        self.bones = img_res[self._dips[1]]
-        return self.bones
 
     def _get_intensities_hist(self):
         _, _, patches = plt.hist(self.img_data.flatten().astype(dtype=np.uint16), bins=MAX_VOXEL_VALUE)
@@ -129,7 +141,7 @@ class PreProcessor:
         plt.savefig(self.output_directory + "histogram")
         plt.show()
 
-    def find_first_minima(self,connectivity_cmps):
+    def find_all_minima(self, connectivity_cmps):
         """
 
         :return:
@@ -183,4 +195,4 @@ if __name__ == "__main__":
         ob = PreProcessor(file_path=file, output_directory=output_directory)
         ob.extract_pelvis_bone()
         ob.get_Nlargest_component(output_directory=output_directory)
-
+    #
