@@ -6,18 +6,10 @@ from skimage.morphology import (erosion, dilation, closing, opening,
 import nibabel as nib
 from matplotlib import pyplot as plt
 import multiprocessing
-
-from skimage.exposure import equalize_adapthist, equalize_hist
-import pydicom as dcm
-import threading
-
 from glob import glob
 import dcmstack
 import pandas as pd
-import os
-from torchviz import make_dot
-import dcm2niix
-import dicom2nifti
+
 
 MAX_VOXEL_VALUE = 65535
 MIN_VOXEL_VALUE = 0
@@ -40,9 +32,6 @@ class PreProcessor:
         self.equalized_img = None
         self.bones = None
         self.Imax = Imax
-
-        # self._num_cores = multiprocessing.cpu_count()
-        # self.chunks = [self.img_data[:,:,chunk * s:] for chunk in range(self._num_cores)]
 
 
     def _read_file(self, file_path:str):
@@ -75,8 +64,6 @@ class PreProcessor:
         """
 
         img = np.copy(self.img_data.astype(dtype=np.uint16))
-        # img = np.array(equalize_adapthist(img/MAX_VOXEL_VALUE, nbins=MAX_VOXEL_VALUE) * MAX_VOXEL_VALUE, dtype=np.uint16).clip(0,MAX_VOXEL_VALUE)
-
         img[(img <= Imax) & (img > Imin)] = MAX_VOXEL_VALUE
         img[img < MAX_VOXEL_VALUE] = 0
         opened_img = skimage.morphology.opening(img)
@@ -86,42 +73,59 @@ class PreProcessor:
 
     def SkeletonTHFinder(self):
         """
-        This function iterates over 25 candidate Imin thresholds in the range of [150,500] (with intervals of 14).
-        In each run, use the SegmentationByTH function you’ve implemented, and count the number of connectivity components
-        in the resulting segmentation with the current Imin. Plot your results – number of connectivity components per Imin.
-        Choose the Imin which is the first or second minima in the plot. Also, make sure to include that graph in your report.
-
-        Next, you need to perform post-processing (morphological operations – clean out single pixels, close holes, etc.)
-        until you are left with a single connectivity component.
-        Finally, this function should save a segmentation NIFTI file called “<nifty_file>_SkeletonSegmentation.nii.gz” and
-        return the Imin used for that.
+        This function will find the best threshold for the skeleton segmentation, by iterating over Haunsfield units in the
+        range of 150-510, using parallel multiprocessing run.
         :return:
         """
-        Imin_range = np.arange(150, 514, self.resolution)
+
+        # Prepare processes for task:
         num_cores = multiprocessing.cpu_count()
-        img_res = [[] for _ in range(num_cores)]
-        ccmps = [[] for _ in range(num_cores)]
-        d = ((514 - 150)//self.resolution)//num_cores
-        ranges = [np.arange(start=150+r*d*self.resolution, stop=150+r*d*self.resolution+d*self.resolution,
-                            step=self.resolution) for r in range(num_cores)]
-        processes = [multiprocessing.Process(target=self.do_segmentation, args=(ranges[p],ccmps,img_res)) for p in range(num_cores)]
+
+        # Prepare tasks distribution between all processes:
+        ranges = self._tasks_distribution(num_cores)
+
+        # Queue fpr saving process's results
+        q = multiprocessing.Queue()
+
+        # Create all the processes, according to the number of cores available:
+        processes = [multiprocessing.Process(target=self.do_segmentation, args=(ranges[pid],)) for pid in range(num_cores)]
+
+        # Execution:
         for p in processes:
             p.start()
-        # self.do_segmentation(Imin_range, ccmps, img_res)
+
         for p in processes:
             p.join()
-        self.find_all_minima(ccmps)
+
+        print("Finished!")
+        cmps = []
+        img_threshold_result = []
+        for img_res, conncented_components in q.get():
+            cmps.extend(conncented_components)
+            img_threshold_result.extend(img_res)
+        # q.close()
+        # Find all local minima
+        self.find_all_minima(cmps)
         self._get_intensities_hist()
-        self.bones = img_res[self._dips[1]]
+        self.bones = img_threshold_result[self._dips[0]]
         return self.bones
 
-    def do_segmentation(self, Imin_range, ccmps, img_res):
+    def _tasks_distribution(self, num_cores):
+        d = ((514 - 150) // self.resolution) // num_cores
+        ranges = [
+            np.arange(start=150 + r * d * self.resolution, stop=150 + r * d * self.resolution + d * self.resolution,
+                      step=self.resolution) for r in range(num_cores)]
+        return ranges
+
+    def do_segmentation(self, Imin_range):
+        img_res = []
+        ccmps = []
         for i_min in Imin_range:
             img = self.SegmentationByTH(i_min, self.Imax)
             _, cmp = label(img, return_num=True)
-            print(f"cmp:{cmp} and imin: {i_min}")
             ccmps.append(cmp)
             img_res.append(img)
+        # q.put([img_res, ccmps])
 
     def _get_intensities_hist(self):
         _, _, patches = plt.hist(self.img_data.flatten().astype(dtype=np.uint16), bins=MAX_VOXEL_VALUE)
@@ -143,7 +147,8 @@ class PreProcessor:
 
     def find_all_minima(self, connectivity_cmps):
         """
-
+        Given an array of integers, this function will find all the minima points, and save the indices of all of them
+        in the _dips array.
         :return:
         """
         minimas = np.array(connectivity_cmps)
@@ -158,10 +163,17 @@ class PreProcessor:
         # Step 2: Apply Thresholding for Skeleton
         self.bones = self.SkeletonTHFinder()
         final_image = nib.Nifti1Image(self.bones, self.raw_img.affine)
-        nib.save(final_image, "out_seg.nii.gz")
+        nib.save(final_image, "../out_seg.nii.gz")
         # Step 3: Get a general ROI
 
     def get_Nlargest_component(self, output_directory=""):
+        """
+        This function should be called after we performed a thresholding for the skeleton.
+        It will utilize the result kept in self.bones, and will return the largest connected component, i.e., the
+        patience skeleton.
+        :param output_directory:
+        :return:
+        """
         labels = label(self.bones)
         largestCC = labels == np.argmax(np.bincount(labels.flat)[1:]) + 1
         largestCC_img = self.bones*largestCC
