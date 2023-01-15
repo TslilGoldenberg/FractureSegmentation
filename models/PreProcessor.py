@@ -1,5 +1,6 @@
 import numpy as np
 import skimage
+from scipy.signal import find_peaks
 from skimage.measure import label
 from skimage.morphology import (erosion, dilation, closing, opening,
                                 area_closing, area_opening)
@@ -8,14 +9,13 @@ from matplotlib import pyplot as plt
 import multiprocessing
 from glob import glob
 import dcmstack
-import pandas as pd
-
 
 MAX_VOXEL_VALUE = 65535
 MIN_VOXEL_VALUE = 0
 FAILURE = -1
 DERIVATIVE_KERNEL = [1, -1]
 NIFTI = 'nii'
+
 
 class PreProcessor:
     def __init__(self, file_path: str, output_directory: str, resolution=10, Imax=1300):
@@ -33,8 +33,7 @@ class PreProcessor:
         self.bones = None
         self.Imax = Imax
 
-
-    def _read_file(self, file_path:str):
+    def _read_file(self, file_path: str):
         if self.isNIFTI:
             self.raw_img = nib.load(file_path)
             return
@@ -47,11 +46,9 @@ class PreProcessor:
             nifti = stack.to_nifti(embed_meta=True)
         self.raw_img = nifti
 
-
     def transform_to_hu(self):
         self.img_data *= float(self.img_header['slope'])
         self.img_data += float(self.img_header['inter'])
-
 
     def SegmentationByTH(self, Imin, Imax):
         """
@@ -77,38 +74,39 @@ class PreProcessor:
         range of 150-510, using parallel multiprocessing run.
         :return:
         """
+        with multiprocessing.Manager() as manager:
+            # Prepare processes for task:
+            num_cores = multiprocessing.cpu_count()
 
-        # Prepare processes for task:
-        num_cores = multiprocessing.cpu_count()
+            # Prepare tasks distribution between all processes:
+            ranges = self._tasks_distribution(num_cores)
 
-        # Prepare tasks distribution between all processes:
-        ranges = self._tasks_distribution(num_cores)
+            # Save process's results in a dictionary, where keys are PIDs and values are [connected components,
+            # [threshold images]]
+            results = manager.dict()
+            # Create all the processes, according to the number of cores available:
+            processes = [multiprocessing.Process(target=self.do_segmentation, args=(ranges[pid], results, pid)) for pid
+                         in range(num_cores)]
+            # Execution:
+            for p in processes: p.start()
 
-        # Queue fpr saving process's results
-        q = multiprocessing.Queue()
+            for p in processes:
+                p.join()
 
-        # Create all the processes, according to the number of cores available:
-        processes = [multiprocessing.Process(target=self.do_segmentation, args=(ranges[pid],)) for pid in range(num_cores)]
-
-        # Execution:
-        for p in processes:
-            p.start()
-
-        for p in processes:
-            p.join()
-
-        print("Finished!")
-        cmps = []
-        img_threshold_result = []
-        for img_res, conncented_components in q.get():
-            cmps.extend(conncented_components)
-            img_threshold_result.extend(img_res)
-        # q.close()
-        # Find all local minima
-        self.find_all_minima(cmps)
-        self._get_intensities_hist()
-        self.bones = img_threshold_result[self._dips[0]]
-        return self.bones
+            print("Finished!")
+            cmps = []
+            img_threshold_result = []
+            for p in range(num_cores):
+                pid_ccmps, pid_imgs = results[p]
+                cmps.extend(pid_ccmps)
+                img_threshold_result.extend(pid_imgs)
+            plt.plot(cmps)
+            plt.show()
+            # Find all local minima
+            self.find_all_minima(cmps)
+            self._get_intensities_hist()
+            self.bones = img_threshold_result[self._dips[0]]
+            return self.bones
 
     def _tasks_distribution(self, num_cores):
         d = ((514 - 150) // self.resolution) // num_cores
@@ -117,7 +115,7 @@ class PreProcessor:
                       step=self.resolution) for r in range(num_cores)]
         return ranges
 
-    def do_segmentation(self, Imin_range):
+    def do_segmentation(self, Imin_range, dct, pid):
         img_res = []
         ccmps = []
         for i_min in Imin_range:
@@ -125,7 +123,40 @@ class PreProcessor:
             _, cmp = label(img, return_num=True)
             ccmps.append(cmp)
             img_res.append(img)
-        # q.put([img_res, ccmps])
+        process_results = ccmps, img_res
+        dct[pid] = process_results
+        print(f"Process {pid} is Done!")
+
+    def find_suspected_pelvis_loc(self, density:np.ndarray):
+        # Find the most prominent critical points of density in the skeleton layer
+        peaks, _ = find_peaks(density, distance=150)
+        deeps,_ = find_peaks(density*-1, distance=200)
+
+        # Calculate the top 2 maxima
+        x1_max, x2_max = peaks[np.argpartition(density[peaks], -2)[-2:][::-1]]
+
+        # Calculate the most likely minima points which bounds the pelvis region
+        minimas = deeps[np.argpartition(-1 * density[deeps], -2)[::-1]]
+        # TODO(we can do much better here, choose the closest minima which is "relatively" close to it's neighbors
+        #  minima)
+        lower_bounds = minimas[np.argwhere(minimas < x1_max)[0]]
+        upper_bounds = minimas[np.argwhere(minimas > x1_max)[0]]
+        upper_bound, lower_bound = upper_bounds[0],lower_bounds[0]
+
+        # Get tightest bounds for Pelvis ROI:
+        for upper in range(upper_bounds.shape[0]-1):
+            ratio = upper_bounds[upper]/upper_bounds[upper+1]
+            if ratio > 1.5:
+                upper_bound = upper_bounds[upper+1]
+
+        for lower in range(lower_bounds.shape[0]-1):
+            ratio = lower_bounds[lower] / lower_bounds[lower + 1]
+            if ratio < 1.5:
+                lower_bound = lower_bounds[lower + 1]
+        return lower_bound, upper_bound
+
+
+
 
     def _get_intensities_hist(self):
         _, _, patches = plt.hist(self.img_data.flatten().astype(dtype=np.uint16), bins=MAX_VOXEL_VALUE)
@@ -136,9 +167,9 @@ class PreProcessor:
             opt_thresh *= 10
             opt_thresh += 150
             d.append(opt_thresh)
-            for p in patches[opt_thresh: opt_thresh+3]:
+            for p in patches[opt_thresh: opt_thresh + 3]:
                 p.set_fc("red")
-            for p in patches[opt_thresh-3:opt_thresh]:
+            for p in patches[opt_thresh - 3:opt_thresh]:
                 p.set_fc("red")
 
         plt.title(f"Intensities histogram. dips in {d}")
@@ -156,15 +187,10 @@ class PreProcessor:
         self._dips = np.where((minimas[1:-1] < minimas[0:-2]) * (
                 minimas[1:-1] < minimas[2:]))[0]
 
-
     def extract_pelvis_bone(self):
-        # Step 1: Apply Adaptive Histogram Equalizer
-
-        # Step 2: Apply Thresholding for Skeleton
         self.bones = self.SkeletonTHFinder()
         final_image = nib.Nifti1Image(self.bones, self.raw_img.affine)
         nib.save(final_image, "../out_seg.nii.gz")
-        # Step 3: Get a general ROI
 
     def get_Nlargest_component(self, output_directory=""):
         """
@@ -176,35 +202,36 @@ class PreProcessor:
         """
         labels = label(self.bones)
         largestCC = labels == np.argmax(np.bincount(labels.flat)[1:]) + 1
-        largestCC_img = self.bones*largestCC
+        largestCC_img = self.bones * largestCC
         largestCC_img = skimage.morphology.closing(largestCC_img)
-        largestCC_img = skimage.morphology.opening(largestCC_img)
-        self.get_pelvis_ROI()
+        # largestCC_img = skimage.morphology.opening(largestCC_img)
+        lower_bound, upper_bound = self.get_pelvis_ROI()
+        largestCC_img = largestCC_img[:,:,lower_bound:upper_bound]
         final_image = nib.Nifti1Image(largestCC_img, self.raw_img.affine)
         nib.save(final_image, f"{output_directory}out_largestCC.nii.gz")
 
     def get_pelvis_ROI(self):
         bin_res = np.zeros(self.img_data.copy().shape)
         bin_res[self.bones > 0] = 1
-        slices = np.sum(bin_res, axis=(0,1))
-        plt.plot(np.arange(slices.shape[0]), slices)
+        slices = np.sum(bin_res, axis=(0, 1))
+        lower_bound, upper_bound = self.find_suspected_pelvis_loc(density=slices)
+        plt.plot(np.arange(lower_bound, upper_bound), slices[lower_bound:upper_bound])
         plt.title(f"Density level in CT with {self.img_data.shape[2]} slices")
         plt.xlabel("Slices index")
         plt.ylabel("Intensity Density")
-        plt.savefig(f"{self.output_directory}density")
+        plt.savefig(f"{self.output_directory}density.png")
         plt.show()
-        # res = bin_res[:,:,100:400]
-        # final_image = nib.Nifti1Image(bin_res, self.raw_img.affine)
-        # nib.save(final_image, self.output_directory+"ROI_test.nii.gz")
+        return lower_bound, upper_bound
 
     def getImageData(self):
         return self.raw_img.get_fdata()
 
+
 if __name__ == "__main__":
-    for i in range (1,20):
-        output_directory= f"output_directory_{i}/"
+    for i in range(1, 20):
+        output_directory = f"output_directory_{i}/"
+        print(f"running {i}")
         file = f"dicom_directory/{i}/IM_0000.dcm"
         ob = PreProcessor(file_path=file, output_directory=output_directory)
         ob.extract_pelvis_bone()
         ob.get_Nlargest_component(output_directory=output_directory)
-    #
